@@ -5,12 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "einops>=0.8.2",
+    "numpy>=2.4.2",
 ]
 
 [project.optional-dependencies]
 gpu = [
     "torch",
     "torchvision",
+    "jax[cuda12,gpu]>=0.6.2",
+    "flash-linear-attention[gpu]>=0.4.1",
 ]
 tpu = [
     "jax[tpu]",
