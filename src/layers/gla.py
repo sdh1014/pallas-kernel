@@ -222,6 +222,7 @@ class GatedLinearAttention(nnx.Module):
             last_state = past_key_values[self.layer_idx]
 
         cu_seqlens = kwargs.get('cu_seqlens')
+        chunk_size = 16
 
         # NOTE: 不实现 attention_mask → unpad 逻辑 (JAX 不使用动态 index scatter)
         # 如果需要变长打包，直接传 cu_seqlens
@@ -303,6 +304,7 @@ class GatedLinearAttention(nnx.Module):
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
+                chunk_size=chunk_size,
             )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
