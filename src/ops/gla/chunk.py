@@ -65,11 +65,7 @@ def chunk_cumsum_kernel(
     if HAS_SCALE:
         o = o * scale
 
-    if IS_VARLEN:
-        o = (o * valid_mask).astype(o_ref.dtype)
-    else:
-        o = o.astype(o_ref.dtype)
-    o_ref[i_bh, dslice(start_t, BT), dslice(start_s, BS)] = o
+    o_ref[i_bh, dslice(start_t, BT), dslice(start_s, BS)] = o.astype(o_ref.dtype)
 
 
 def chunk_local_cumsum_vector(
