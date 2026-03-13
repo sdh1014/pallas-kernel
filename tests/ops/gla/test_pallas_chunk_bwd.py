@@ -73,8 +73,8 @@ def test_chunk_gla_bwd(cfg):
 
     # Torch CPU (handles padding internally)
     dq_cpu, dk_cpu, dv_cpu, dg_cpu, dh0_cpu = cpu_chunk_gla_bwd(
-        q.float(), k.float(), v.float(), g.float(), scale,
-        initial_state=h0, do=do.float(), dht=dht, chunk_size=C,
+        q.float(), k.float(), v.float(), g.float(),
+        None, scale, h0, None, None, do.float(), dht, chunk_size=C,
     )
 
     # JAX (caller must pad T to multiple of chunk_size)

@@ -1,6 +1,5 @@
 from .naive import naive_recurrent_gla
 from .chunk import (
-    chunk_gla,
     chunk_local_cumsum,
     chunk_fwd_h,
     chunk_gla_fwd_intra_gk,
@@ -12,13 +11,14 @@ from .chunk import (
     chunk_gla_bwd_dqk_intra,
     chunk_gla_bwd_dqkg,
     chunk_gla_bwd,
+    pad_varlen_seqs,
+    unpad_varlen_seqs,
 )
 from .fused_chunk import fused_chunk_gla
 from .fused_recurrent import fused_recurrent_gla, fused_recurrent_gla_bwd
 
 __all__ = [
     "naive_recurrent_gla",
-    "chunk_gla",
     "chunk_local_cumsum",
     "chunk_fwd_h",
     "chunk_gla_fwd_intra_gk",
@@ -30,6 +30,8 @@ __all__ = [
     "chunk_gla_bwd_dqk_intra",
     "chunk_gla_bwd_dqkg",
     "chunk_gla_bwd",
+    "pad_varlen_seqs",
+    "unpad_varlen_seqs",
     "fused_chunk_gla",
     "fused_recurrent_gla",
     "fused_recurrent_gla_bwd",

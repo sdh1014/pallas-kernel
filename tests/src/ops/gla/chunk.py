@@ -1,6 +1,100 @@
 import torch
 import torch.nn.functional as F
 
+def cdiv(x: torch.Tensor, y: int):
+    return (x + y - 1) // y
+
+def align_up(x: torch.Tensor, align: int):
+    return cdiv(x, align) * align
+
+def pad_to_multiple(x: torch.Tensor, multiple: int | list, axis: int | list, val):
+    if isinstance(multiple, int):
+        multiple = [multiple]
+    if isinstance(axis, int):
+        axis = [axis]
+
+    assert len(multiple) == len(axis), (
+        f"Length of multiple {len(multiple)} must match length of axis {len(axis)}"
+    )
+
+    shape = list(x.shape)
+    pad_width = [(0, 0)] * len(shape)
+    for idx in range(0, len(axis)):
+        ax = axis[idx]
+        mu = multiple[idx]
+        length = shape[ax]
+        remainder = length % mu
+        if remainder == 0:
+            continue
+        pad_len = mu - remainder
+        pad_width[ax] = (0, pad_len)
+    return F.pad(x, pad_width, value=val)
+
+
+def pad_varlen_seqs(
+    tensors: list[torch.Tensor],
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+) -> tuple[list[torch.Tensor], torch.Tensor, list[int] | None, list[int] | None]:
+    """Pad each variable-length segment along dim=1 to a multiple of chunk_size.
+
+    Args:
+        tensors: list of [1, T_total, ...] tensors sharing the same sequence layout
+        cu_seqlens: [N+1] cumulative sequence lengths
+        chunk_size: block size
+
+    Returns:
+        (padded_tensors, new_cu_seqlens, orig_seqlens, padded_seqlens)
+        If no padding is needed, returns (tensors, cu_seqlens, None, None).
+    """
+    N = len(cu_seqlens) - 1
+    orig_seqlens = torch.diff(cu_seqlens).tolist()
+    padded_seqlens = [((L + chunk_size - 1) // chunk_size) * chunk_size for L in orig_seqlens]
+
+    if orig_seqlens == padded_seqlens:
+        return tensors, cu_seqlens, None, None
+
+    padded = [[] for _ in tensors]
+    for i in range(N):
+        bos = cu_seqlens[i].item()
+        L = orig_seqlens[i]
+        pad = padded_seqlens[i] - L
+        for j, t in enumerate(tensors):
+            seg = t[:, bos:bos + L]
+            padded[j].append(
+                F.pad(seg, (0, 0, 0, 0, 0, pad)) if pad > 0 else seg
+            )
+
+    padded_tensors = [torch.cat(p, dim=1) for p in padded]
+    offsets = [0]
+    for pl in padded_seqlens:
+        offsets.append(offsets[-1] + pl)
+    new_cu_seqlens = torch.tensor(offsets, dtype=torch.long)
+
+    return padded_tensors, new_cu_seqlens, orig_seqlens, padded_seqlens
+
+
+def unpad_varlen_seqs(
+    tensor: torch.Tensor,
+    orig_seqlens: list[int],
+    padded_seqlens: list[int],
+) -> torch.Tensor:
+    """Remove per-segment padding from a variable-length tensor along dim=1.
+
+    Args:
+        tensor: [1, T_padded_total, ...] padded tensor
+        orig_seqlens: original segment lengths
+        padded_seqlens: padded segment lengths
+
+    Returns:
+        [1, T_total, ...] tensor with padding removed
+    """
+    parts = []
+    offset = 0
+    for L, PL in zip(orig_seqlens, padded_seqlens):
+        parts.append(tensor[:, offset:offset + L])
+        offset += PL
+    return torch.cat(parts, dim=1)
 
 # =============================================================================
 # Sub-function 1: chunk_local_cumsum
@@ -19,13 +113,25 @@ def chunk_local_cumsum(
     Args:
         g: [B, T, H, K] — log-space gates (T must be a multiple of chunk_size)
         chunk_size: block size
-        cu_seqlens: unused, kept for FLA interface compatibility
+        cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode.
+            When provided, B must be 1 and each segment length must be a
+            multiple of chunk_size.
 
     Returns:
         g_cumsum: [B, T, H, K] — chunk-local cumsum
     """
     B, T, H, K = g.shape
     C = chunk_size
+
+    if cu_seqlens is not None:
+        assert B == 1
+        N = len(cu_seqlens) - 1
+        g_cumsum = torch.zeros_like(g)
+        for i in range(N):
+            bos, eos = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            g_cumsum[:, bos:eos] = chunk_local_cumsum(g[:, bos:eos], chunk_size)
+        return g_cumsum
+
     NT = T // C
     g_cumsum = g.view(B, NT, C, H, K).cumsum(dim=2).view(B, T, H, K)
     return g_cumsum
@@ -56,18 +162,38 @@ def chunk_fwd_h(
         k:  [B, T, H, K] — keys (T must be a multiple of chunk_size)
         v:  [B, T, H, V] — values
         gk: [B, T, H, K] — chunk-local cumsum of gates
-        h0: [B, H, K, V] — initial hidden state (optional)
+        h0: [B, H, K, V] or [N, H, K, V] (varlen) — initial hidden state (optional)
         output_final_state: whether to return final state
-        cu_seqlens: unused, kept for FLA interface compatibility
+        cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode.
+            When provided, B must be 1.  h0 shape is [N, H, K, V].
+            Returns h [1, NT_total, H, K, V] and ht [N, H, K, V].
         chunk_size: block size
 
     Returns:
         h:  [B, NT, H, K, V] — hidden state at the start of each chunk
-        ht: [B, H, K, V] or None — final hidden state
+        ht: [B, H, K, V] or [N, H, K, V] (varlen) or None — final hidden state
     """
     B, T, H, K = k.shape
     V = v.shape[-1]
     C = chunk_size
+
+    if cu_seqlens is not None:
+        assert B == 1
+        N = len(cu_seqlens) - 1
+        h_list, ht_list = [], []
+        for i in range(N):
+            bos, eos = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            h0_i = h0[i:i+1] if h0 is not None else None
+            h_seg, ht_seg = chunk_fwd_h(
+                k[:, bos:eos], v[:, bos:eos], gk[:, bos:eos],
+                h0=h0_i, output_final_state=output_final_state, chunk_size=chunk_size)
+            h_list.append(h_seg)
+            if ht_seg is not None:
+                ht_list.append(ht_seg.squeeze(0))
+        h_all = torch.cat(h_list, dim=1)
+        ht = torch.stack(ht_list) if ht_list else None
+        return h_all, ht
+
     NT = T // C
 
     k_c = k.view(B, NT, C, H, K)
@@ -123,19 +249,41 @@ def chunk_bwd_dh(
         v:   [B, T, H, V]
         gk:  [B, T, H, K] — chunk-local cumsum of gates
         do:  [B, T, H, V] — output gradient
-        h0:  [B, H, K, V] — initial hidden state (optional)
-        dht: [B, H, K, V] — terminal state gradient (optional)
+        h0:  [B, H, K, V] or [N, H, K, V] (varlen) — initial hidden state (optional)
+        dht: [B, H, K, V] or [N, H, K, V] (varlen) — terminal state gradient (optional)
         scale: scaling factor
-        cu_seqlens: unused
+        cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode.
+            When provided, B must be 1.  h0/dht shape is [N, H, K, V].
+            Returns dh [1, NT_total, H, K, V] and dh0 [N, H, K, V].
         chunk_size: block size
 
     Returns:
         dh:  [B, NT, H, K, V]
-        dh0: [B, H, K, V] or None
+        dh0: [B, H, K, V] or [N, H, K, V] (varlen) or None
     """
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = chunk_size
+
+    if cu_seqlens is not None:
+        assert B == 1
+        N = len(cu_seqlens) - 1
+        dh_list, dh0_list = [], []
+        for i in range(N):
+            bos, eos = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            h0_i = h0[i:i+1] if h0 is not None else None
+            dht_i = dht[i:i+1] if dht is not None else None
+            dh_seg, dh0_seg = chunk_bwd_dh(
+                q[:, bos:eos], k[:, bos:eos], v[:, bos:eos],
+                gk[:, bos:eos], do[:, bos:eos],
+                h0=h0_i, dht=dht_i, scale=scale, chunk_size=chunk_size)
+            dh_list.append(dh_seg)
+            if dh0_seg is not None:
+                dh0_list.append(dh0_seg.squeeze(0))
+        dh = torch.cat(dh_list, dim=1)
+        dh0 = torch.stack(dh0_list) if dh0_list else None
+        return dh, dh0
+
     NT = T // C
 
     q_c = q.view(B, NT, C, H, K)
@@ -186,27 +334,47 @@ def chunk_gla_fwd_intra_gk(
         k: [B, T, H, K] — keys
         g: [B, T, H, K] — chunk-local cumsum of gates
         scale: scaling factor
-        cu_seqlens: unused, kept for FLA interface compatibility
+        cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode.
+            When provided, B must be 1.
         chunk_size: block size
 
     Returns:
-        A: [B, NT, H, C, C] — intra-chunk causal attention matrix
+        A: [B, T, H, BT] — intra-chunk attention matrix (float32)
     """
     B, T, H, K = q.shape
-    C = chunk_size
-    NT = T // C
+    BT = chunk_size
 
-    q_c = q.view(B, NT, C, H, K)
-    k_c = k.view(B, NT, C, H, K)
-    g_c = g.view(B, NT, C, H, K)
+    if cu_seqlens is not None:
+        assert B == 1
+        N = len(cu_seqlens) - 1
+        A_list = []
+        for i in range(N):
+            bos, eos = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            A_seg = chunk_gla_fwd_intra_gk(
+                q[:, bos:eos], k[:, bos:eos], g[:, bos:eos],
+                scale, chunk_size=chunk_size)
+            A_list.append(A_seg)
+        return torch.cat(A_list, dim=1)
 
-    q_gated = q_c * g_c.exp()  # [B, NT, C, H, K]
-    k_gated = k_c * (-g_c).exp()  # [B, NT, C, H, K]
+    NT = T // BT
 
-    # A[b,n,h,i,j] = scale * Σ_k q_gated[b,n,i,h,k] * k_gated[b,n,j,h,k]
-    A = torch.einsum("bnihk,bnjhk->bnihj", q_gated, k_gated) * scale  # [B, NT, H, C, C]
+    q_c = q.view(B, NT, BT, H, K)
+    k_c = k.view(B, NT, BT, H, K)
+    g_c = g.view(B, NT, BT, H, K)
 
-    return A
+    # 数值稳定: 引入参考点 g_n (每个 chunk 第一行)
+    g_n = g_c[:, :, 0:1, :, :]  # [B, NT, 1, H, K]
+    q_gated = q_c * (g_c - g_n).exp()  # [B, NT, BT, H, K]
+    k_gated = k_c * (g_n - g_c).exp()  # [B, NT, BT, H, K]
+
+    # A[b,n,i,h,j] = scale * Σ_k q_gated[b,n,i,h,k] * k_gated[b,n,j,h,k]
+    A = torch.einsum("bnihk,bnjhk->bnihj", q_gated, k_gated) * scale
+
+    # Causal mask: 上三角清零
+    causal_mask = torch.tril(torch.ones(BT, BT, dtype=torch.bool, device=q.device))
+    A = A.masked_fill(~causal_mask[None, None, :, None, :], 0.0)
+
+    return A.reshape(B, T, H, BT)
 
 
 # =============================================================================
@@ -217,7 +385,7 @@ def chunk_gla_fwd_intra_gk(
 def chunk_gla_fwd_o_gk(
     q: torch.Tensor,
     v: torch.Tensor,
-    gk: torch.Tensor,
+    g: torch.Tensor,
     A: torch.Tensor,
     h: torch.Tensor,
     scale: float,
@@ -239,7 +407,7 @@ def chunk_gla_fwd_o_gk(
         q: [B, T, H, K] — queries
         v: [B, T, H, V] — values
         g: [B, T, H, K] — chunk-local cumsum of gates
-        A: [B, NT, H, C, C] — intra-chunk attention matrix
+        A: [B, T, H, BT] — intra-chunk attention matrix
         h: [B, NT, H, K, V] — hidden state at start of each chunk
         scale: scaling factor
         cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode
@@ -259,25 +427,20 @@ def chunk_gla_fwd_o_gk(
 
     q = q.reshape(-1, C, H, K)
     v = v.reshape(-1, C, H, V)
-    gk = gk.reshape(-1, C, H, K)
+    g = g.reshape(-1, C, H, K)
     h = h.reshape(-1, H, K, V)
     A = A.reshape(-1, C, H, C)
 
-    qg = q * gk.exp()
+    qg = q * g.exp()
 
     # Inter-chunk: o_inter = scale * (q_gated @ h)
     o_inter = scale * torch.einsum(
         "nchk,nhkv->nchv", qg, h
     )  # [C, K] @ [K, V] -> [C, V]
 
-    causal_mask = torch.tril(torch.ones((C, C), dtype=torch.bool))[
-        :, None, :
-    ]  # (C, 1, C) → broadcasts to (NT, C, H, C)
-    n_A = torch.where(causal_mask, A, 0.0)
-
     # [C, C] @ [C, V] -> [C, V]
     # Intra-chunk: o_intra = A @ v, contract over j (key position within chunk)
-    o_intra = torch.einsum("nihj,njhv->nihv", n_A, v)
+    o_intra = torch.einsum("nihj,njhv->nihv", A, v)
 
     o = (o_inter + o_intra).reshape(B, T, H, V)
     return o
@@ -315,132 +478,79 @@ def chunk_gla_fwd(
         scale: scaling factor
         initial_state: [B, H, K, V] or None
         output_final_state: whether to return final hidden state
-        cu_seqlens: unused, kept for FLA interface compatibility
+        cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode
         chunk_size: block size
 
     Returns:
-        (g_cumsum, A, h, ht, o)
+        (g_cumsum, A, h, ht, o)  — o has the original (unpadded) T length
     """
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = chunk_size
-    NT = (T + C - 1) // C
-    T_padded = NT * C
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1
 
-    if T_padded > T:
-        pad = T_padded - T
-        q = F.pad(q, (0, 0, 0, 0, 0, pad))
-        k = F.pad(k, (0, 0, 0, 0, 0, pad))
-        v = F.pad(v, (0, 0, 0, 0, 0, pad))
-        g = F.pad(g, (0, 0, 0, 0, 0, pad))
+    # --- padding ---
+    orig_seqlens = None
+    padded_seqlens = None
+
+    if cu_seqlens is not None:
+        assert B == 1
+        [q, k, v, g], cu_seqlens, orig_seqlens, padded_seqlens = pad_varlen_seqs(
+            [q, k, v, g], cu_seqlens, C
+        )
+    else:
+        T_padded = ((T + C - 1) // C) * C
+        if T_padded > T:
+            pad = T_padded - T
+            pads = (0, 0, 0, 0, 0, pad)
+            q = F.pad(q, pads)
+            k = F.pad(k, pads)
+            v = F.pad(v, pads)
+            g = F.pad(g, pads)
+
+    T_padded = q.shape[1]
+    NT = T_padded // C
+
+    # --- forward ---
 
     if g_cumsum is None:
-        g_cumsum = chunk_local_cumsum(g, C)
+        g_cumsum = chunk_local_cumsum(g, C, cu_seqlens)
+        assert g_cumsum.shape == g.shape
+        assert g_cumsum.dtype == g.dtype
 
     h, ht = chunk_fwd_h(
         k,
         v,
-        g_cumsum,
+        gk=g_cumsum,
         h0=initial_state,
         output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
         chunk_size=C,
     )
-    A = chunk_gla_fwd_intra_gk(q, k, g_cumsum, scale, chunk_size=C)
-    o = chunk_gla_fwd_o_gk(q, v, g_cumsum, A, h, scale, chunk_size=C)
+    assert (B, NT, H, K, V) == h.shape
+    assert (N, H, K, V) == ht.shape if ht is not None else True
+    assert h.dtype == k.dtype
+    assert ht.dtype == k.dtype if ht is not None else True
 
-    o = o[:, :T]
-    return g_cumsum, A, h, ht, o
+    A = chunk_gla_fwd_intra_gk(q, k, g=g_cumsum, scale=scale, cu_seqlens=cu_seqlens, chunk_size=C)
+    assert (B, T_padded, H, C) == A.shape
+    assert A.dtype == torch.float32, "Attention matrix must be float32 for numerical stability"
 
+    o = chunk_gla_fwd_o_gk(q, v, g=g_cumsum, A=A, h=h, scale=scale, cu_seqlens=cu_seqlens, chunk_size=C)
+    assert (B, T_padded, H, V) == o.shape
+    assert o.dtype == v.dtype
 
-# =============================================================================
-# Public API: chunk_gla
-# =============================================================================
-
-
-def chunk_gla(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    scale: float | None = None,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_size: int = 16,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Chunked GLA — pure PyTorch CPU implementation.
-
-    Splits the sequence into blocks of chunk_size and computes in parallel
-    within each block, propagating hidden states across blocks.
-    Mathematically equivalent to naive_recurrent_gla.
-
-    The gate parameter is named ``g`` (matching the FLA chunk_gla API),
-    not ``gk`` as in fused_recurrent_gla.
-
-    Args:
-        q: [B, T, H, K]
-        k: [B, T, H, K]
-        v: [B, T, H, V]
-        g: [B, T, H, K] — gates (log-space, after logsigmoid)
-        scale: scaling factor, default K^{-0.5}
-        initial_state: [N, H, K, V]
-        output_final_state: whether to return final state
-        cu_seqlens: [N+1] variable-length cumulative lengths
-        chunk_size: block size, default 16
-
-    Returns:
-        o: [B, T, H, V]
-        final_state: [N, H, K, V] or None
-    """
-    dtype = q.dtype
-    q, k, v, g = (x.float() for x in (q, k, v, g))
-    B, T, H, K = q.shape
-
-    if scale is None:
-        scale = K**-0.5
-
-    if cu_seqlens is not None:
-        assert B == 1, "cu_seqlens requires B=1"
-        N = len(cu_seqlens) - 1
-        o = torch.zeros_like(v)  # [1, T, H, V]
-        final_states = [] if output_final_state else None
-
-        for i in range(N):
-            bos = cu_seqlens[i].item()
-            eos = cu_seqlens[i + 1].item()
-            h0 = initial_state[i : i + 1] if initial_state is not None else None
-
-            _, _, _, ht_seg, o_seg = chunk_gla_fwd(
-                q[:, bos:eos],
-                k[:, bos:eos],
-                v[:, bos:eos],
-                g[:, bos:eos],
-                g_cumsum=None,
-                scale=scale,
-                initial_state=h0,
-                output_final_state=output_final_state,
-                chunk_size=chunk_size,
-            )
-            o[:, bos:eos] = o_seg
-            if output_final_state:
-                final_states.append(ht_seg.squeeze(0))  # [H, K, V]
-
-        final_state = torch.stack(final_states, dim=0) if output_final_state else None
-        return o.to(dtype), final_state
+    # --- unpadding ---
+    if orig_seqlens is not None:
+        g_cumsum = unpad_varlen_seqs(g_cumsum, orig_seqlens, padded_seqlens)
+        o = unpad_varlen_seqs(o, orig_seqlens, padded_seqlens)
+        A = unpad_varlen_seqs(A, orig_seqlens, padded_seqlens)
     else:
-        _, _, _, ht, o = chunk_gla_fwd(
-            q,
-            k,
-            v,
-            g,
-            g_cumsum=None,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            chunk_size=chunk_size,
-        )
-        final_state = ht if output_final_state else None
-        return o.to(dtype), final_state
+        o = o[:, :T]
+        g_cumsum = g_cumsum[:, :T]
+        A = A[:, :T]
+
+    return g_cumsum, A, h, ht, o
 
 
 # =============================================================================
@@ -461,6 +571,8 @@ def chunk_gla_bwd_dA(
         v:  [B, T, H, V]
         do: [B, T, H, V]
         scale: scaling factor
+        cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode.
+            When provided, B must be 1.
         chunk_size: block size
 
     Returns:
@@ -468,6 +580,16 @@ def chunk_gla_bwd_dA(
     """
     B, T, H, V = v.shape
     C = chunk_size
+
+    if cu_seqlens is not None:
+        assert B == 1
+        N = len(cu_seqlens) - 1
+        dA = torch.zeros(1, T, H, C, dtype=v.dtype, device=v.device)
+        for i in range(N):
+            bos, eos = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            dA[:, bos:eos] = chunk_gla_bwd_dA(v[:, bos:eos], do[:, bos:eos], scale, chunk_size=chunk_size)
+        return dA
+
     NT = T // C
 
     v_c = v.view(B, NT, C, H, V)
@@ -502,6 +624,9 @@ def chunk_gla_bwd_dv(
         A:        [B, T, H, C] — intra-chunk attention matrix
         do:       [B, T, H, V]
         dh:       [B, NT, H, K, V]
+        cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode.
+            When provided, B must be 1.  dh is [1, NT_total, H, K, V] with
+            chunks from all segments concatenated along dim-1.
         chunk_size: block size
 
     Returns:
@@ -510,6 +635,22 @@ def chunk_gla_bwd_dv(
     B, T, H, K = k.shape
     V = do.shape[-1]
     C = chunk_size
+
+    if cu_seqlens is not None:
+        assert B == 1
+        N = len(cu_seqlens) - 1
+        dv = torch.zeros(1, T, H, V, dtype=do.dtype, device=do.device)
+        chunk_offset = 0
+        for i in range(N):
+            bos, eos = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            NT_seg = (eos - bos) // C
+            dv[:, bos:eos] = chunk_gla_bwd_dv(
+                k[:, bos:eos], g_cumsum[:, bos:eos], A[:, bos:eos],
+                do[:, bos:eos], dh[:, chunk_offset:chunk_offset+NT_seg],
+                chunk_size=chunk_size)
+            chunk_offset += NT_seg
+        return dv
+
     NT = T // C
 
     k_c = k.view(B, NT, C, H, K)
@@ -518,10 +659,8 @@ def chunk_gla_bwd_dv(
     A_c = A.view(B, NT, C, H, C)
 
     # Intra: dv[j] = sum_{i>=j} A[i,j] * do[i]
-    # A is lower-triangular (nonzero when i >= j), keep those entries
-    causal_mask = torch.tril(torch.ones(C, C, dtype=torch.bool))
-    A_masked = torch.where(causal_mask[None, None, :, None, :], A_c, 0.0)
-    dv_intra = torch.einsum("bnihj,bnihv->bnjhv", A_masked, do_c)
+    # A is already lower-triangular masked by chunk_gla_fwd_intra_gk
+    dv_intra = torch.einsum("bnihj,bnihv->bnjhv", A_c, do_c)
 
     # Inter: k_decay @ dh
     gn = gc_c[:, :, -1, :, :]  # [B, NT, H, K]
@@ -552,6 +691,8 @@ def chunk_gla_bwd_dqk_intra(
         k:        [B, T, H, K]
         g_cumsum: [B, T, H, K]
         dA:       [B, T, H, C]
+        cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode.
+            When provided, B must be 1.
         chunk_size: block size
 
     Returns:
@@ -559,6 +700,21 @@ def chunk_gla_bwd_dqk_intra(
     """
     B, T, H, K = q.shape
     C = chunk_size
+
+    if cu_seqlens is not None:
+        assert B == 1
+        N = len(cu_seqlens) - 1
+        dq_out = torch.zeros_like(q)
+        dk_out = torch.zeros_like(k)
+        for i in range(N):
+            bos, eos = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            dq_seg, dk_seg = chunk_gla_bwd_dqk_intra(
+                q[:, bos:eos], k[:, bos:eos], g_cumsum[:, bos:eos],
+                dA[:, bos:eos], chunk_size=chunk_size)
+            dq_out[:, bos:eos] = dq_seg
+            dk_out[:, bos:eos] = dk_seg
+        return dq_out, dk_out
+
     NT = T // C
 
     q_c = q.view(B, NT, C, H, K)
@@ -605,6 +761,9 @@ def chunk_gla_bwd_dqkg(
         dh:       [B, NT, H, K, V]
         dq, dk:   [B, T, H, K] — intra-chunk gradients
         scale: scaling factor
+        cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode.
+            When provided, B must be 1.  h and dh are [1, NT_total, H, K, V]
+            with chunks from all segments concatenated along dim-1.
         chunk_size: block size
 
     Returns:
@@ -613,6 +772,28 @@ def chunk_gla_bwd_dqkg(
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = chunk_size
+
+    if cu_seqlens is not None:
+        assert B == 1
+        N = len(cu_seqlens) - 1
+        dq_out, dk_out, dg_out = (torch.zeros_like(q) for _ in range(3))
+        chunk_offset = 0
+        for i in range(N):
+            bos, eos = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            NT_seg = (eos - bos) // C
+            dq_seg, dk_seg, dg_seg = chunk_gla_bwd_dqkg(
+                q[:, bos:eos], k[:, bos:eos], v[:, bos:eos],
+                h[:, chunk_offset:chunk_offset+NT_seg],
+                g_cumsum[:, bos:eos], do[:, bos:eos],
+                dh[:, chunk_offset:chunk_offset+NT_seg],
+                dq[:, bos:eos], dk[:, bos:eos],
+                scale, chunk_size=chunk_size)
+            dq_out[:, bos:eos] = dq_seg
+            dk_out[:, bos:eos] = dk_seg
+            dg_out[:, bos:eos] = dg_seg
+            chunk_offset += NT_seg
+        return dq_out, dk_out, dg_out
+
     NT = T // C
 
     q_c = q.view(B, NT, C, H, K)
@@ -662,8 +843,11 @@ def chunk_gla_bwd(
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
+    g_cumsum: torch.Tensor | None,
     scale: float,
     initial_state: torch.Tensor | None,
+    h: torch.Tensor,
+    A: torch.Tensor,
     do: torch.Tensor,
     dht: torch.Tensor | None,
     cu_seqlens: torch.LongTensor | None = None,
@@ -671,47 +855,82 @@ def chunk_gla_bwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Chunk GLA backward orchestrator.
 
+    Args:
+        q, k:     [B, T, H, K]
+        v:        [B, T, H, V]
+        g:        [B, T, H, K] — raw log-space gates
+        scale: scaling factor
+        initial_state: [B, H, K, V] or [N, H, K, V] (varlen) — initial hidden state
+        do:       [B, T, H, V] — output gradient
+        dht:      [B, H, K, V] or [N, H, K, V] (varlen) — terminal state gradient
+        cu_seqlens: [N+1] cumulative sequence lengths for variable-length mode.
+            When provided, B must be 1.
+        chunk_size: block size
+
     Returns:
         (dq, dk, dv, dg, dh0)
     """
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = chunk_size
-    NT = (T + C - 1) // C
-    T_padded = NT * C
 
-    if T_padded > T:
-        pad = T_padded - T
-        q = F.pad(q, (0, 0, 0, 0, 0, pad))
-        k = F.pad(k, (0, 0, 0, 0, 0, pad))
-        v = F.pad(v, (0, 0, 0, 0, 0, pad))
-        g = F.pad(g, (0, 0, 0, 0, 0, pad))
-        do = F.pad(do, (0, 0, 0, 0, 0, pad))
+    # --- padding ---
+    orig_seqlens = None
+    padded_seqlens = None
 
-    g_cumsum = chunk_local_cumsum(g, C)
+    if cu_seqlens is not None:
+        assert B == 1
+        [q, k, v, g, do], cu_seqlens, orig_seqlens, padded_seqlens = pad_varlen_seqs(
+            [q, k, v, g, do], cu_seqlens, C
+        )
+    else:
+        T_padded = ((T + C - 1) // C) * C
+        if T_padded > T:
+            pad = T_padded - T
+            pads = (0, 0, 0, 0, 0, pad)
+            q = F.pad(q, pads)
+            k = F.pad(k, pads)
+            v = F.pad(v, pads)
+            g = F.pad(g, pads)
+            do = F.pad(do, pads)
 
-    h, _ = chunk_fwd_h(k, v, g_cumsum, h0=initial_state, output_final_state=False, chunk_size=C)
+    T_padded = q.shape[1]
 
+    # --- recompute forward intermediates ---
+    g_cumsum = chunk_local_cumsum(g, C, cu_seqlens)
+
+    h, _ = chunk_fwd_h(k, v, g_cumsum, h0=initial_state, output_final_state=False,
+                        cu_seqlens=cu_seqlens, chunk_size=C)
+
+    # --- backward ---
     dh, dh0 = chunk_bwd_dh(
-        q, k, v, g_cumsum, do, h0=initial_state, dht=dht, scale=scale, chunk_size=C,
+        q, k, v, g_cumsum, do, h0=initial_state, dht=dht, scale=scale,
+        cu_seqlens=cu_seqlens, chunk_size=C,
     )
 
-    dA = chunk_gla_bwd_dA(v, do, scale, chunk_size=C)
+    dA = chunk_gla_bwd_dA(v, do, scale, cu_seqlens=cu_seqlens, chunk_size=C)
 
-    A = chunk_gla_fwd_intra_gk(q, k, g_cumsum, scale, chunk_size=C)
-    # A is [B, NT, C, H, C], need [B, T, H, C] for dv
+    A = chunk_gla_fwd_intra_gk(q, k, g_cumsum, scale, cu_seqlens=cu_seqlens, chunk_size=C)
     A_flat = A.reshape(B, T_padded, H, C)
-    dv = chunk_gla_bwd_dv(k, g_cumsum, A_flat, do, dh, chunk_size=C)
+    dv = chunk_gla_bwd_dv(k, g_cumsum, A_flat, do, dh, cu_seqlens=cu_seqlens, chunk_size=C)
 
-    dq, dk = chunk_gla_bwd_dqk_intra(q, k, g_cumsum, dA, chunk_size=C)
+    dq, dk = chunk_gla_bwd_dqk_intra(q, k, g_cumsum, dA, cu_seqlens=cu_seqlens, chunk_size=C)
 
     dq, dk, dg = chunk_gla_bwd_dqkg(
-        q, k, v, h, g_cumsum, do, dh, dq, dk, scale, chunk_size=C,
+        q, k, v, h, g_cumsum, do, dh, dq, dk, scale,
+        cu_seqlens=cu_seqlens, chunk_size=C,
     )
 
-    dq = dq[:, :T]
-    dk = dk[:, :T]
-    dv = dv[:, :T]
-    dg = dg[:, :T]
+    # --- unpadding ---
+    if orig_seqlens is not None:
+        dq = unpad_varlen_seqs(dq, orig_seqlens, padded_seqlens)
+        dk = unpad_varlen_seqs(dk, orig_seqlens, padded_seqlens)
+        dv = unpad_varlen_seqs(dv, orig_seqlens, padded_seqlens)
+        dg = unpad_varlen_seqs(dg, orig_seqlens, padded_seqlens)
+    else:
+        dq = dq[:, :T]
+        dk = dk[:, :T]
+        dv = dv[:, :T]
+        dg = dg[:, :T]
 
     return dq, dk, dv, dg, dh0

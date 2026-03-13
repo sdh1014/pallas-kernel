@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import jax
 import jax.numpy as jnp
 
-from tests.src.ops.gla import chunk_gla as cpu_chunk_gla
+from tests.src.ops.gla import chunk_gla_fwd as cpu_chunk_gla_fwd
 from src.ops.gla import chunk_gla as pallas_chunk_gla
 from tests.utils import compare_tensor
 
@@ -142,16 +142,20 @@ def _torch_to_jax(t: torch.Tensor) -> jax.Array:
 
 
 def _run_cpu(q, k, v, *, g, h0=None, cu=None, scale=None):
-    return cpu_chunk_gla(
-        q,
-        k,
-        v,
-        g=g,
+    dtype = q.dtype
+    q, k, v, g = (x.float() for x in (q, k, v, g))
+    K = q.shape[-1]
+    if scale is None:
+        scale = K**-0.5
+    _, _, _, ht, o = cpu_chunk_gla_fwd(
+        q, k, v, g,
+        g_cumsum=None,
+        scale=scale,
         initial_state=h0,
         output_final_state=True,
         cu_seqlens=cu,
-        scale=scale,
     )
+    return o.to(dtype), ht
 
 
 def _run_pallas(q, k, v, *, g, h0=None, cu=None, scale=None, output_final_state=True):
@@ -247,10 +251,18 @@ def test_no_final_state_pallas():
     v = torch.randn(B, T, H, V)
     g = F.logsigmoid(torch.randn(B, T, H, K))
 
-    o_cpu, s_cpu = cpu_chunk_gla(q, k, v, g=g, output_final_state=False)
+    q_f, k_f, v_f, g_f = (x.float() for x in (q, k, v, g))
+    K = q.shape[-1]
+    _, _, _, ht_cpu, o_cpu = cpu_chunk_gla_fwd(
+        q_f, k_f, v_f, g_f,
+        g_cumsum=None,
+        scale=K**-0.5,
+        initial_state=None,
+        output_final_state=False,
+    )
     o_pallas, s_pallas = _run_pallas(q, k, v, g=g, output_final_state=False)
 
-    assert s_cpu is None, f"cpu final_state should be None, got {type(s_cpu)}"
+    assert ht_cpu is None, f"cpu final_state should be None, got {type(ht_cpu)}"
     assert s_pallas is None, f"pallas final_state should be None, got {type(s_pallas)}"
     assert compare_tensor("output", o_cpu, o_pallas, atol=1e-4, rtol=1e-4)
 

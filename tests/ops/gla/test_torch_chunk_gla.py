@@ -6,14 +6,14 @@ import os
 from pathlib import Path
 
 # Disable TF32 for deterministic float32 results on Ampere+ GPUs.
-# os.environ["TRITON_F32_DEFAULT"] = "ieee"
+os.environ["TRITON_F32_DEFAULT"] = "ieee"
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.src.ops.gla import chunk_gla as cpu_chunk_gla
+from tests.src.ops.gla import chunk_gla_fwd as cpu_chunk_gla_fwd
 from tests.utils import compare_tensor
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -40,8 +40,8 @@ requires_triton = pytest.mark.skipif(
 # Each dict can contain:
 #   B, T, H, K, V  — shape (required)
 #   seed            — random seed (required)
-#   atol            — absolute tolerance (default 2e-2)
-#   rtol            — relative tolerance (default 2e-2)
+#   atol            — absolute tolerance (default 5e-5)
+#   rtol            — relative tolerance (default 5e-5)
 #   h0              — True/False, whether to use initial_state (default False)
 #   cu_seqlens      — list[int] or None (default None)
 #   scale           — float or None (default None = K^{-0.5})
@@ -183,16 +183,20 @@ def _run_gold(q, k, v, *, g, h0=None, cu=None, scale=None):
 
 
 def _run_cpu(q, k, v, *, g, h0=None, cu=None, scale=None):
-    return cpu_chunk_gla(
-        q,
-        k,
-        v,
-        g=g,
+    dtype = q.dtype
+    q, k, v, g = (x.float() for x in (q, k, v, g))
+    K = q.shape[-1]
+    if scale is None:
+        scale = K**-0.5
+    _, _, _, ht, o = cpu_chunk_gla_fwd(
+        q, k, v, g,
+        g_cumsum=None,
+        scale=scale,
         initial_state=h0,
         output_final_state=True,
         cu_seqlens=cu,
-        scale=scale,
     )
+    return o.to(dtype), ht
 
 
 # ============================================================================
@@ -204,18 +208,8 @@ def _run_cpu(q, k, v, *, g, h0=None, cu=None, scale=None):
 @pytest.mark.parametrize("cfg", CASES, ids=[_case_id(c) for c in CASES])
 def test_gold_vs_cpu(cfg):
     B, T, H, K, V = cfg["B"], cfg["T"], cfg["H"], cfg["K"], cfg["V"]
-    fp32_atol = 1e-5
-    fp32_rtol = 1e-5
-    if os.environ.get("TRITON_F32_DEFAULT", "") == "ieee":
-        # TF32 disabled, can use tighter tolerances for float32
-        atol = fp32_atol
-        rtol = fp32_rtol
-    else:
-        atol = cfg.get("atol", 2e-2)
-        rtol = cfg.get("rtol", 2e-2)
-
-    atol = cfg.get("atol", atol)
-    rtol = cfg.get("rtol", rtol)
+    atol = cfg.get("atol", 5e-5)
+    rtol = cfg.get("rtol", 5e-5)
     scale = cfg.get("scale", None)
 
     torch.manual_seed(cfg["seed"])
@@ -265,16 +259,16 @@ def test_state_split():
     )
 
     assert compare_tensor(
-        "full state (gold vs cpu)", s_full_gold, s_full_cpu, atol=2e-2, rtol=2e-2
+        "full state (gold vs cpu)", s_full_gold, s_full_cpu, atol=5e-5, rtol=5e-5
     )
     assert compare_tensor(
-        "gold: full vs split", s_full_gold, s2_gold, atol=2e-2, rtol=2e-2
+        "gold: full vs split", s_full_gold, s2_gold, atol=5e-5, rtol=5e-5
     )
     assert compare_tensor(
         "cpu: full vs split", s_full_cpu, s2_cpu, atol=1e-4, rtol=1e-4
     )
     assert compare_tensor(
-        "split state (gold vs cpu)", s2_gold, s2_cpu, atol=2e-2, rtol=2e-2
+        "split state (gold vs cpu)", s2_gold, s2_cpu, atol=5e-5, rtol=5e-5
     )
 
 @requires_triton
@@ -309,16 +303,16 @@ def test_varlen_packed_vs_separate():
     o_cpu, s_cpu = _run_cpu(q_cat, k_cat, v_cat, g=g_cat, cu=cu)
 
     assert compare_tensor(
-        "seg1 output", o1_gold, o_cpu[:, :s1_len], atol=2e-2, rtol=2e-2
+        "seg1 output", o1_gold, o_cpu[:, :s1_len], atol=5e-5, rtol=5e-5
     )
     assert compare_tensor(
-        "seg2 output", o2_gold, o_cpu[:, s1_len:], atol=2e-2, rtol=2e-2
+        "seg2 output", o2_gold, o_cpu[:, s1_len:], atol=5e-5, rtol=5e-5
     )
     assert compare_tensor(
-        "seg1 state", s1_gold.squeeze(0), s_cpu[0], atol=2e-2, rtol=2e-2
+        "seg1 state", s1_gold.squeeze(0), s_cpu[0], atol=5e-5, rtol=5e-5
     )
     assert compare_tensor(
-        "seg2 state", s2_gold.squeeze(0), s_cpu[1], atol=2e-2, rtol=2e-2
+        "seg2 state", s2_gold.squeeze(0), s_cpu[1], atol=5e-5, rtol=5e-5
     )
 
 
@@ -337,11 +331,19 @@ def test_no_final_state():
         g=g.to(DEVICE),
         output_final_state=False,
     )
-    o_cpu, s_cpu = cpu_chunk_gla(q, k, v, g=g, output_final_state=False)
+    q_f, k_f, v_f, g_f = (x.float() for x in (q, k, v, g))
+    K = q.shape[-1]
+    _, _, _, ht_cpu, o_cpu = cpu_chunk_gla_fwd(
+        q_f, k_f, v_f, g_f,
+        g_cumsum=None,
+        scale=K**-0.5,
+        initial_state=None,
+        output_final_state=False,
+    )
 
     assert s_gold is None, f"gold final_state should be None, got {type(s_gold)}"
-    assert s_cpu is None, f"cpu final_state should be None, got {type(s_cpu)}"
-    assert compare_tensor("output", o_gold.cpu(), o_cpu, atol=2e-2, rtol=2e-2)
+    assert ht_cpu is None, f"cpu final_state should be None, got {type(ht_cpu)}"
+    assert compare_tensor("output", o_gold.cpu(), o_cpu, atol=5e-5, rtol=5e-5)
 
 
 if __name__ == "__main__":
