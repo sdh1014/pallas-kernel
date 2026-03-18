@@ -26,23 +26,23 @@ import jax.numpy as jnp
 from flax import nnx
 
 # Import both implementations
-from src.torch.ops.gla import (
+from tests.src.ops.gla import (
     naive_recurrent_gla as torch_naive_recurrent_gla,
     chunk_gla as torch_chunk_gla,
     fused_chunk_gla as torch_fused_chunk_gla,
 )
 
-from src.torch.layers.gla import GatedLinearAttention as TorchGLA
+from tests.src.layers.gla import GatedLinearAttention as TorchGLA
 
-from src.torch.modules.convolution import ShortConvolution as TorchShortConv
-from src.torch.modules.layernorm import RMSNorm as TorchRMSNorm
-from src.torch.modules.fused_norm_gate import FusedRMSNormGated as TorchFNG
+from tests.src.modules.convolution import ShortConvolution as TorchShortConv
+from tests.src.modules.layernorm import RMSNorm as TorchRMSNorm
+from tests.src.modules.fused_norm_gate import FusedRMSNormGated as TorchFNG
 
-from src.jax.ops.gla import naive_recurrent_gla as jax_naive_recurrent_gla
-from src.jax.layers.gla import GatedLinearAttention as JaxGLA
-from src.jax.modules.layernorm import RMSNorm as JaxRMSNorm
-from src.jax.modules.fused_norm_gate import FusedRMSNormGated as JaxFusedRMSNormGated
-from src.jax.modules.convolution import ShortConvolution as JaxShortConv
+from tops.ops.gla import naive_recurrent_gla as jax_naive_recurrent_gla
+from tops.layers.gla import GatedLinearAttention as JaxGLA
+from tops.modules.layernorm import RMSNorm as JaxRMSNorm
+from tops.modules.fused_norm_gate import FusedRMSNormGated as JaxFusedRMSNormGated
+from tops.modules.convolution import ShortConvolution as JaxShortConv
 
 
 # =============================================================================
@@ -1081,7 +1081,7 @@ def run_test_attention_mask_pipeline() -> bool:
 
     Tests: get_unpad_data, index_first_axis, pad_input pipeline.
     """
-    from src.torch.layers.utils import (
+    from tests.src.layers.utils import (
         get_unpad_data,
         index_first_axis,
         pad_input,
