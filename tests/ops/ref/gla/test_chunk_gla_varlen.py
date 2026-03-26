@@ -240,11 +240,11 @@ def test_gla_varlen_cpu_vs_triton(cfg):
         chunk_size=C,
     )
 
-    compare_tensor("output", o_tri.float().numpy(), np.array(o_cpu, dtype=np.float32),
+    assert compare_tensor("output", o_tri.float().numpy(), np.array(o_cpu, dtype=np.float32),
                    atol=atol, rtol=rtol)
 
     if ht_tri is not None and ht_cpu is not None:
-        compare_tensor("final_state", ht_tri.float().numpy(), np.array(ht_cpu, dtype=np.float32),
+        assert compare_tensor("final_state", ht_tri.float().numpy(), np.array(ht_cpu, dtype=np.float32),
                        atol=atol, rtol=rtol)
 
 
@@ -291,7 +291,7 @@ def test_gla_varlen_cpu_vs_triton_with_h0():
         chunk_size=C,
     )
 
-    compare_tensor("output", o_tri.float().numpy(), np.array(o_cpu, dtype=np.float32),
+    assert compare_tensor("output", o_tri.float().numpy(), np.array(o_cpu, dtype=np.float32),
                    atol=5e-5, rtol=5e-5)
-    compare_tensor("final_state", ht_tri.float().numpy(), np.array(ht_cpu, dtype=np.float32),
+    assert compare_tensor("final_state", ht_tri.float().numpy(), np.array(ht_cpu, dtype=np.float32),
                    atol=5e-5, rtol=5e-5)

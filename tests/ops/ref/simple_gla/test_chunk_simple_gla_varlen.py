@@ -152,7 +152,7 @@ def test_simple_gla_varlen_fwd(cfg, gate):
     )
     o_ind, _ = _run_independent_batch(q, k, v, cu, C, g=g, g_gamma=g_gamma)
 
-    compare_tensor("output", o_var, o_ind, atol=1e-5, rtol=1e-5, compare_dtype=np.float64)
+    assert compare_tensor("output", o_var, o_ind, atol=1e-5, rtol=1e-5, compare_dtype=np.float64)
 
 
 # ============================================================================
@@ -178,9 +178,9 @@ def test_simple_gla_varlen_with_h0():
         q, k, v, cu, C, g=g, initial_state=h0, output_final_state=True
     )
 
-    compare_tensor("output", o_var, o_ind, atol=1e-5, rtol=1e-5, compare_dtype=np.float64)
+    assert compare_tensor("output", o_var, o_ind, atol=1e-5, rtol=1e-5, compare_dtype=np.float64)
     assert ht_var.shape == (2, H, K, V)
-    compare_tensor("final_state", ht_var, ht_ind, atol=1e-5, rtol=1e-5, compare_dtype=np.float64)
+    assert compare_tensor("final_state", ht_var, ht_ind, atol=1e-5, rtol=1e-5, compare_dtype=np.float64)
 
 
 # ============================================================================
@@ -232,9 +232,9 @@ def test_simple_gla_varlen_cpu_vs_triton(cfg):
         chunk_size=C,
     )
 
-    compare_tensor("output", o_tri.float().numpy(), np.array(o_cpu, dtype=np.float32),
+    assert compare_tensor("output", o_tri.float().numpy(), np.array(o_cpu, dtype=np.float32),
                    atol=atol, rtol=rtol)
 
     if ht_tri is not None and ht_cpu is not None:
-        compare_tensor("final_state", ht_tri.float().numpy(), np.array(ht_cpu, dtype=np.float32),
+        assert compare_tensor("final_state", ht_tri.float().numpy(), np.array(ht_cpu, dtype=np.float32),
                        atol=atol, rtol=rtol)
