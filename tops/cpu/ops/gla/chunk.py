@@ -36,7 +36,9 @@ from tops.cpu.ops.common.utils import acc_dtype as _acc_dtype
 from tops.cpu.ops.common.utils import cdiv as _cdiv
 from tops.cpu.ops.common.utils import dot as _dot
 from tops.cpu.ops.common.utils import pad_to_multiple as _pad_to_multiple
-from tops.cpu.ops.common.utils import pad_varlen_seqs, unpad_varlen_seqs
+from tops.cpu.ops.common.utils import gather_chunks, scatter_chunks
+from tops.utils import prepare_chunk_indices, prepare_lens
+from tops.utils import cdiv as _cdiv_top
 from tops.cpu.ops.common.chunk_h import chunk_fwd_h, chunk_bwd_dh
 from tops.cpu.ops.common.chunk_o import chunk_local_cumsum
 
@@ -174,33 +176,55 @@ def chunk_gla_fwd(
   V = v.shape[-1]
   C = chunk_size
 
-  # --- Varlen pad ---
+  # --- Varlen gather+flatten ---
   is_varlen = cu_seqlens is not None
   if is_varlen:
-    tensors_to_pad = [t for t in [q, k, v, g] if t is not None]
-    padded, padded_cu, orig_seqlens, padded_seqlens = pad_varlen_seqs(
-      tensors_to_pad, cu_seqlens, C
-    )
-    q, k, v = padded[0], padded[1], padded[2]
-    g = padded[3] if g is not None else None
+    chunk_indices = prepare_chunk_indices(cu_seqlens, C)
+    total_NT = chunk_indices.shape[0]
+
+    # Gather to chunked layout [total_NT, C, H, K]
+    q_c, valid_lens = gather_chunks(q, cu_seqlens, chunk_indices, C)
+    k_c, _ = gather_chunks(k, cu_seqlens, chunk_indices, C)
+    v_c, _ = gather_chunks(v, cu_seqlens, chunk_indices, C)
+    g_c, _ = gather_chunks(g, cu_seqlens, chunk_indices, C)
+
+    # chunk_local_cumsum on chunked layout (cu_seqlens triggers chunked branch)
+    if g_cumsum is None:
+      g_cumsum_c = chunk_local_cumsum(g_c, C, cu_seqlens=cu_seqlens)
+    else:
+      g_cumsum_c = g_cumsum  # already computed
+
+    # Flatten to [1, total_NT*C, H, K]
+    q = q_c.reshape(1, total_NT * C, H, K)
+    k = k_c.reshape(1, total_NT * C, H, K)
+    v = v_c.reshape(1, total_NT * C, H, V)
+    g_cumsum = g_cumsum_c.reshape(1, total_NT * C, *g_cumsum_c.shape[2:])
+
+    # Build flat cu_seqlens for boundary reset
+    lens = prepare_lens(cu_seqlens)
+    n_chunks_per_seq = jnp.array([int(_cdiv_top(int(l), C)) for l in lens])
+    flat_cu_seqlens = jnp.concatenate([
+      jnp.zeros(1, dtype=jnp.int32),
+      jnp.cumsum(n_chunks_per_seq * C),
+    ])
+
+    T_padded = total_NT * C
   else:
-    padded_cu = None
-    orig_seqlens = None
+    flat_cu_seqlens = None
 
-  T = q.shape[1]
+    T = q.shape[1]
+    # Existing padding for non-chunk-aligned T
+    T_padded = _cdiv(T, C) * C
+    if T_padded > T:
+      q = _pad_to_multiple(q, C, axis=1)
+      k = _pad_to_multiple(k, C, axis=1)
+      v = _pad_to_multiple(v, C, axis=1)
+      g = _pad_to_multiple(g, C, axis=1)
 
-  # Existing padding for non-chunk-aligned T (no-op after varlen pad)
-  T_padded = _cdiv(T, C) * C
-  if T_padded > T:
-    q = _pad_to_multiple(q, C, axis=1)
-    k = _pad_to_multiple(k, C, axis=1)
-    v = _pad_to_multiple(v, C, axis=1)
-    g = _pad_to_multiple(g, C, axis=1)
+    if g_cumsum is None:
+      g_cumsum = chunk_local_cumsum(g, C)
 
   NT = T_padded // C
-
-  if g_cumsum is None:
-    g_cumsum = chunk_local_cumsum(g, C, cu_seqlens=padded_cu if is_varlen else None)
 
   # Forward: states_in_fp32=False → h in k.dtype
   h, ht = chunk_fwd_h(
@@ -211,7 +235,7 @@ def chunk_gla_fwd(
     output_final_state=output_final_state,
     chunk_size=C,
     states_in_fp32=False,
-    cu_seqlens=padded_cu if is_varlen else None,
+    cu_seqlens=flat_cu_seqlens if is_varlen else None,
   )
 
   # A: fp32
@@ -227,10 +251,14 @@ def chunk_gla_fwd(
   # Output: v.dtype
   o = chunk_gla_fwd_o_gk(q, v, g=g_cumsum, A=A, h=h, scale=scale, chunk_size=C)
 
-  # Unpad
+  # Scatter output back to packed layout
   if is_varlen:
-    o = unpad_varlen_seqs(o, orig_seqlens, padded_seqlens)
-    g_cumsum_out = g_cumsum  # keep padded for potential bwd use
+    o_c = o.reshape(total_NT, C, H, V)
+    o = scatter_chunks(
+      jnp.zeros((1, T_orig, H, V), dtype=o.dtype),
+      o_c, cu_seqlens, chunk_indices, C, valid_lens,
+    )
+    g_cumsum_out = g_cumsum  # keep flat for potential bwd use
     A_out = A
   else:
     o = o[:, :T_orig]
@@ -466,37 +494,57 @@ def chunk_gla_bwd(
   V = v.shape[-1]
   C = chunk_size
 
-  # --- Varlen pad ---
+  # --- Varlen gather+flatten ---
   is_varlen = cu_seqlens is not None
   if is_varlen:
-    tensors_to_pad = [t for t in [q, k, v, g, do] if t is not None]
-    padded, padded_cu, orig_seqlens, padded_seqlens = pad_varlen_seqs(
-      tensors_to_pad, cu_seqlens, C
-    )
-    q, k, v = padded[0], padded[1], padded[2]
-    idx = 3
-    if g is not None:
-      g = padded[idx]
-      idx += 1
-    do = padded[idx]
+    chunk_indices = prepare_chunk_indices(cu_seqlens, C)
+    total_NT = chunk_indices.shape[0]
+
+    # Gather to chunked layout [total_NT, C, ...]
+    q_c, valid_lens = gather_chunks(q, cu_seqlens, chunk_indices, C)
+    k_c, _ = gather_chunks(k, cu_seqlens, chunk_indices, C)
+    v_c, _ = gather_chunks(v, cu_seqlens, chunk_indices, C)
+    g_c, _ = gather_chunks(g, cu_seqlens, chunk_indices, C)
+    do_c, _ = gather_chunks(do, cu_seqlens, chunk_indices, C)
+
+    # chunk_local_cumsum on chunked layout
+    if g_cumsum is None:
+      g_cumsum_c = chunk_local_cumsum(g_c, C, cu_seqlens=cu_seqlens)
+    else:
+      g_cumsum_c = g_cumsum
+
+    # Flatten to [1, total_NT*C, ...]
+    q = q_c.reshape(1, total_NT * C, H, K)
+    k = k_c.reshape(1, total_NT * C, H, K)
+    v = v_c.reshape(1, total_NT * C, H, V)
+    do = do_c.reshape(1, total_NT * C, H, V)
+    g_cumsum = g_cumsum_c.reshape(1, total_NT * C, *g_cumsum_c.shape[2:])
+
+    # Build flat cu_seqlens for boundary reset
+    lens = prepare_lens(cu_seqlens)
+    n_chunks_per_seq = jnp.array([int(_cdiv_top(int(l), C)) for l in lens])
+    flat_cu_seqlens = jnp.concatenate([
+      jnp.zeros(1, dtype=jnp.int32),
+      jnp.cumsum(n_chunks_per_seq * C),
+    ])
+
+    T_padded = total_NT * C
   else:
-    padded_cu = None
-    orig_seqlens = None
+    flat_cu_seqlens = None
 
-  T = q.shape[1]
+    T = q.shape[1]
+    # Existing padding
+    T_padded = _cdiv(T, C) * C
+    if T_padded > T:
+      q = _pad_to_multiple(q, C, axis=1)
+      k = _pad_to_multiple(k, C, axis=1)
+      v = _pad_to_multiple(v, C, axis=1)
+      g = _pad_to_multiple(g, C, axis=1)
+      do = _pad_to_multiple(do, C, axis=1)
 
-  # Existing padding
-  T_padded = _cdiv(T, C) * C
-  if T_padded > T:
-    q = _pad_to_multiple(q, C, axis=1)
-    k = _pad_to_multiple(k, C, axis=1)
-    v = _pad_to_multiple(v, C, axis=1)
-    g = _pad_to_multiple(g, C, axis=1)
-    do = _pad_to_multiple(do, C, axis=1)
-
-  # Recompute g_cumsum
-  if g_cumsum is None:
-    g_cumsum = chunk_local_cumsum(g, C, cu_seqlens=padded_cu if is_varlen else None)
+    # Recompute g_cumsum
+    if g_cumsum is None:
+      g_cumsum = chunk_local_cumsum(g, C)
 
   # Recompute h with states_in_fp32=True (FLA backward behavior)
   if h is None:
@@ -508,7 +556,7 @@ def chunk_gla_bwd(
       output_final_state=False,
       chunk_size=C,
       states_in_fp32=True,
-      cu_seqlens=padded_cu if is_varlen else None,
+      cu_seqlens=flat_cu_seqlens if is_varlen else None,
     )
 
   # dh: fp32
@@ -520,7 +568,7 @@ def chunk_gla_bwd(
     dht=dht,
     scale=scale,
     chunk_size=C,
-    cu_seqlens=padded_cu if is_varlen else None,
+    cu_seqlens=flat_cu_seqlens if is_varlen else None,
   )
 
   # Recompute A if not provided
@@ -557,12 +605,28 @@ def chunk_gla_bwd(
     chunk_size=C,
   )
 
-  # Unpad
+  # Scatter gradients back to packed layout
   if is_varlen:
-    dq = unpad_varlen_seqs(dq, orig_seqlens, padded_seqlens)
-    dk = unpad_varlen_seqs(dk, orig_seqlens, padded_seqlens)
-    dv = unpad_varlen_seqs(dv, orig_seqlens, padded_seqlens)
-    dg = unpad_varlen_seqs(dg, orig_seqlens, padded_seqlens)
+    dq_c = dq.reshape(total_NT, C, H, K)
+    dk_c = dk.reshape(total_NT, C, H, K)
+    dv_c = dv.reshape(total_NT, C, H, V)
+    dg_c = dg.reshape(total_NT, C, H, K)
+    dq = scatter_chunks(
+      jnp.zeros((1, T_orig, H, K), dtype=dq.dtype),
+      dq_c, cu_seqlens, chunk_indices, C, valid_lens,
+    )
+    dk = scatter_chunks(
+      jnp.zeros((1, T_orig, H, K), dtype=dk.dtype),
+      dk_c, cu_seqlens, chunk_indices, C, valid_lens,
+    )
+    dv = scatter_chunks(
+      jnp.zeros((1, T_orig, H, V), dtype=dv.dtype),
+      dv_c, cu_seqlens, chunk_indices, C, valid_lens,
+    )
+    dg = scatter_chunks(
+      jnp.zeros((1, T_orig, H, K), dtype=dg.dtype),
+      dg_c, cu_seqlens, chunk_indices, C, valid_lens,
+    )
   else:
     dq = dq[:, :T_orig]
     dk = dk[:, :T_orig]
