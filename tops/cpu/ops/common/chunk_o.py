@@ -41,14 +41,15 @@ def chunk_local_cumsum(
       g_cumsum: same shape as g, in fp32 (or fp64 for fp64 input)
   """
   if cu_seqlens is not None:
-    N = len(cu_seqlens) - 1
-    segments = []
-    for n in range(N):
-      bos = int(cu_seqlens[n])
-      eos = int(cu_seqlens[n + 1])
-      seg = g[:, bos:eos]
-      segments.append(chunk_local_cumsum(seg, chunk_size, reverse))
-    return jnp.concatenate(segments, axis=1)
+    # Input is chunked layout: [total_NT, C, ...] — each chunk independent
+    acc = acc_dtype(g.dtype)
+    g_cast = g.astype(acc)
+    if reverse:
+      g_cast = jnp.flip(g_cast, axis=1)
+    g_cumsum = g_cast.cumsum(axis=1)
+    if reverse:
+      g_cumsum = jnp.flip(g_cumsum, axis=1)
+    return g_cumsum
 
   C = chunk_size
   T = g.shape[1]
