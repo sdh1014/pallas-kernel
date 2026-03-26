@@ -1,77 +1,78 @@
-"""Tests for pad_varlen_seqs / unpad_varlen_seqs."""
+"""Tests for gather_chunks / scatter_chunks."""
+
 import jax
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
-import pytest
-from tops.cpu.ops.common.utils import pad_varlen_seqs, unpad_varlen_seqs
+from tops.cpu.ops.common.utils import gather_chunks, scatter_chunks
+from tops.utils import prepare_chunk_indices
 
 
-def test_pad_no_padding_needed():
-    """Chunk-aligned segments should return original tensors."""
-    q = jnp.ones((1, 32, 4, 16))
+def test_gather_aligned():
+    """Chunk-aligned segments: gather all chunks correctly."""
+    q = jnp.arange(32).reshape(1, 32, 1, 1).astype(jnp.float32)
     cu = jnp.array([0, 16, 32])
-    padded, new_cu, orig, pad_lens = pad_varlen_seqs([q], cu, chunk_size=16)
-    assert padded[0].shape == (1, 32, 4, 16)
-    assert jnp.array_equal(new_cu, cu)
-    assert orig == [16, 16]
-    assert pad_lens == [16, 16]
+    ci = prepare_chunk_indices(cu, 16)
+    chunks, vlens = gather_chunks(q, cu, ci, 16)
+    assert chunks.shape == (2, 16, 1, 1)
+    assert jnp.all(vlens == 16)
+    assert jnp.allclose(chunks[0, :, 0, 0], jnp.arange(16, dtype=jnp.float32))
+    assert jnp.allclose(chunks[1, :, 0, 0], jnp.arange(16, 32, dtype=jnp.float32))
 
 
-def test_pad_unequal_segments():
-    """Non-aligned segments get zero-padded per segment."""
+def test_gather_unaligned():
+    """Non-aligned last chunk: valid positions filled, rest zero."""
     q = jnp.ones((1, 30, 2, 8))
     cu = jnp.array([0, 10, 30])
-    padded, new_cu, orig, pad_lens = pad_varlen_seqs([q], cu, chunk_size=16)
-    assert padded[0].shape == (1, 48, 2, 8)
-    assert jnp.array_equal(new_cu, jnp.array([0, 16, 48]))
-    assert orig == [10, 20]
-    assert pad_lens == [16, 32]
-    assert jnp.all(padded[0][0, 10:16] == 0)
+    ci = prepare_chunk_indices(cu, 16)
+    chunks, vlens = gather_chunks(q, cu, ci, 16)
+    assert chunks.shape == (3, 16, 2, 8)
+    assert int(vlens[0]) == 10
+    assert jnp.all(chunks[0, :10] == 1)
+    assert jnp.all(chunks[0, 10:] == 0)
+    assert int(vlens[1]) == 16
+    assert int(vlens[2]) == 4
+    assert jnp.all(chunks[2, 4:] == 0)
 
 
-def test_pad_3d_tensor():
-    """Works for 3D [B, T, H] tensors (Simple GLA g)."""
+def test_gather_3d():
+    """Works for 3D [1, T, H] tensors (Simple GLA g)."""
     g = jnp.ones((1, 30, 4))
     cu = jnp.array([0, 10, 30])
-    padded, new_cu, orig, pad_lens = pad_varlen_seqs([g], cu, chunk_size=16)
-    assert padded[0].shape == (1, 48, 4)
+    ci = prepare_chunk_indices(cu, 16)
+    chunks, vlens = gather_chunks(g, cu, ci, 16)
+    assert chunks.shape == (3, 16, 4)
 
 
-def test_pad_multiple_tensors():
-    """Pads all tensors identically."""
-    q = jnp.ones((1, 30, 2, 8))
-    k = jnp.ones((1, 30, 2, 8)) * 2
+def test_scatter_roundtrip():
+    """gather then scatter recovers original (for valid positions)."""
+    key = jax.random.PRNGKey(0)
+    q = jax.random.normal(key, (1, 30, 2, 8))
     cu = jnp.array([0, 10, 30])
-    [pq, pk], new_cu, orig, pad_lens = pad_varlen_seqs([q, k], cu, chunk_size=16)
-    assert pq.shape == pk.shape == (1, 48, 2, 8)
-    assert jnp.all(pk[0, :10] == 2)
-
-
-def test_unpad_roundtrip():
-    """pad then unpad recovers original."""
-    q = jax.random.normal(jax.random.PRNGKey(0), (1, 30, 2, 8))
-    cu = jnp.array([0, 10, 30])
-    [pq], new_cu, orig, pad_lens = pad_varlen_seqs([q], cu, chunk_size=16)
-    recovered = unpad_varlen_seqs(pq, orig, pad_lens)
-    assert recovered.shape == q.shape
+    ci = prepare_chunk_indices(cu, 16)
+    chunks, vlens = gather_chunks(q, cu, ci, 16)
+    buf = jnp.zeros_like(q)
+    recovered = scatter_chunks(buf, chunks, cu, ci, 16, vlens)
     assert jnp.allclose(recovered, q)
 
 
-def test_unpad_3d():
-    """unpad works for 3D tensors."""
-    g = jax.random.normal(jax.random.PRNGKey(1), (1, 30, 4))
+def test_scatter_3d():
+    """scatter works for 3D tensors."""
+    key = jax.random.PRNGKey(1)
+    g = jax.random.normal(key, (1, 30, 4))
     cu = jnp.array([0, 10, 30])
-    [pg], _, orig, pad_lens = pad_varlen_seqs([g], cu, chunk_size=16)
-    recovered = unpad_varlen_seqs(pg, orig, pad_lens)
+    ci = prepare_chunk_indices(cu, 16)
+    chunks, vlens = gather_chunks(g, cu, ci, 16)
+    buf = jnp.zeros_like(g)
+    recovered = scatter_chunks(buf, chunks, cu, ci, 16, vlens)
     assert jnp.allclose(recovered, g)
 
 
 def test_single_token_segment():
-    """Segment of length 1 should pad to chunk_size."""
+    """Segment of length 1: one chunk with valid_len=1."""
     q = jnp.ones((1, 17, 2, 8))
     cu = jnp.array([0, 1, 17])
-    [pq], new_cu, orig, pad_lens = pad_varlen_seqs([q], cu, chunk_size=16)
-    assert orig == [1, 16]
-    assert pad_lens == [16, 16]
-    assert pq.shape == (1, 32, 2, 8)
+    ci = prepare_chunk_indices(cu, 16)
+    chunks, vlens = gather_chunks(q, cu, ci, 16)
+    assert int(vlens[0]) == 1
+    assert jnp.all(chunks[0, 1:] == 0)
